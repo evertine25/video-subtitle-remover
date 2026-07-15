@@ -29,6 +29,21 @@ If the subtitle color is close to the background, refined pixel-color masks may 
 
 The current implementation supports only one subtitle color at a time. Videos containing subtitles with multiple primary colors are not currently supported. If your video does not meet these conditions, consider using the original project's subtitle-removal pipeline.
 
+## Results Demonstration
+
+The image below compares the original rectangular mask with this fork's refined mask during subtitle detection and LAMA inpainting:
+
+![Refined subtitle-mask results comparison](design/demonew.png)
+
+Starting from the top-left and moving clockwise, the four panels show:
+
+- **Top-left: Original frame with subtitles**;
+- **Top-right: Subtitle-detection preview**. Green boxes are the original OCR detections, orange boxes are the expanded regions used to recover missed punctuation and other subtitle pixels, and black pixels indicate the final subtitle mask;
+- **Bottom-right: LAMA result using this fork's refined mask**;
+- **Bottom-left: LAMA result using the original project's rectangular mask**.
+
+Compared with masking the entire OCR rectangle, the refined mask reduces unnecessary coverage of nearby backgrounds and character artwork. In this example, LAMA has a smaller reconstruction area and preserves more of the original background structure and character details. Actual results depend on subtitle color, background complexity, scene motion, and OCR quality.
+
 ## Usage
 
 ### Installation
