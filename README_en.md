@@ -134,18 +134,6 @@ Notes:
 - `lama` is currently the recommended mode to try first. ProPainter may leave subtitle artifacts in some scenes, and STTN has not yet been tested extensively;
 - when `use_refined_mask` is disabled, the pipeline falls back to the original OCR rectangular-mask workflow.
 
-## Configuration Reference
-
-The INI file also includes the following features:
-
-- `crop_before_ocr`: Crop each configured region before running OCR;
-- `crop_padding`, `crop_upscale`: Control the retained border and scale of the OCR crop;
-- `secondary_mask`: A secondary detection mode for special subtitle colors on the left side of the frame;
-- `temporal`: Controls future-frame mask reuse, stability checks, and temporal continuity;
-- `preview`: Controls whether OCR boxes and expanded boxes are drawn in the preview video.
-
-Adjust only a few parameters at a time and use short clips for repeated previews. This makes it easier to understand the effect of each parameter.
-
 ## Limitations
 
 The additional features in this fork are primarily intended for a personal project and specific game-story videos. General-purpose performance is limited, and some features are still under development. Results may vary depending on subtitle style, background complexity, character motion, and particle effects.

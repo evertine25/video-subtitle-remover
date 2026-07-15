@@ -134,18 +134,6 @@ python backend/main.py `
 - 目前推荐优先尝试 `lama`。ProPainter 在部分场景下可能残留字幕伪影，STTN 尚未测试；
 - 如果关闭 `use_refined_mask`，流程会回退到原项目的 OCR 矩形 Mask。
 
-## 配置文件
-
-`subtitle_mask_config.ini` 中还包含以下功能：
-
-- `crop_before_ocr`：先裁剪指定区域，再分别执行 OCR；
-- `crop_padding`、`crop_upscale`：控制 OCR 裁剪区域的边缘保留和放大倍数；
-- `secondary_mask`：用于处理画面左侧特殊字幕颜色的第二套检测模式；
-- `temporal`：控制未来帧 Mask 借用、稳定性判断和连续性保持；
-- `preview`：控制预览视频中是否绘制 OCR 框和扩展后的检测框。
-
-建议一次只调整少量参数，并使用短片段反复预览，以便判断每个参数对 Mask 的具体影响。
-
 ## 局限性
 
 本 fork 中新增代码由 GPT-5.6 辅助生成，仅供个人项目使用。新增功能主要面向特定视频类型，泛用性有限，部分功能有待完善。实际效果会受到字幕样式、背景复杂度和画面运动等因素影响。
