@@ -16,7 +16,11 @@ from backend.inpaint.video.model.recurrent_flow_completion import RecurrentFlowC
 from backend.inpaint.video.model.propainter import InpaintGenerator
 from backend.inpaint.video.core.utils import to_tensors
 from backend.inpaint.video.model.misc import get_device
-from backend.tools.inpaint_tools import get_inpaint_area_by_mask
+from backend.tools.inpaint_tools import (
+    get_inpaint_area_by_mask,
+    normalize_frame_masks,
+    union_frame_masks,
+)
 
 import warnings
 
@@ -34,7 +38,11 @@ def read_mask(mpath, length, size, flow_mask_dilates=8, mask_dilates=5):
     masks_dilated = []
     flow_masks = []
     # 如果传入的直接为numpy array
-    if isinstance(mpath, np.ndarray):
+    if isinstance(mpath, (list, tuple)):
+        if len(mpath) != length:
+            raise ValueError("ProPainter mask count must match frame count")
+        masks_img = [Image.fromarray(np.asarray(mask)) for mask in mpath]
+    elif isinstance(mpath, np.ndarray):
         if mpath.ndim == 3 and mpath.shape[2] == 1:
             mpath = mpath.squeeze(2)  # 从 (H,W,1) 转为 (H,W)
         elif mpath.ndim == 3 and mpath.shape[2] == 3:
@@ -365,7 +373,8 @@ class PropainterInpaint:
         :param input_frames: 原视频帧
         :param input_mask: 字幕区域mask
         """
-        mask = input_mask[:, :, None]
+        frame_masks = normalize_frame_masks(input_mask, len(input_frames))
+        mask = union_frame_masks(frame_masks)[:, :, None]
         H_ori, W_ori = mask.shape[:2]
         H_ori = int(H_ori + 0.5)
         W_ori = int(W_ori + 0.5)
@@ -390,14 +399,17 @@ class PropainterInpaint:
             # 对每个去除部分进行切割和缩放
             for k in range(len(inpaint_area)):
                 image_crop = image[inpaint_area[k][0]:inpaint_area[k][1], inpaint_area[k][2]:inpaint_area[k][3], :]  # 切割
-                mask_crop = mask[inpaint_area[k][0]:inpaint_area[k][1], inpaint_area[k][2]:inpaint_area[k][3], :]  # 切割
+                mask_crop = frame_masks[j][
+                    inpaint_area[k][0]:inpaint_area[k][1],
+                    inpaint_area[k][2]:inpaint_area[k][3],
+                ]
                 frames_scaled[k].append(image_crop)  # 将缩放后的帧添加到对应列表
                 masks_scaled[k].append(mask_crop)  # 将缩放后的遮罩添加到对应列表
 
         # 处理每一个去除部分
         for k in range(len(inpaint_area)):
             # 调用inpaint函数进行处理
-            comps[k] = self.inpaint(frames_scaled[k], masks_scaled[k][0])
+            comps[k] = self.inpaint(frames_scaled[k], masks_scaled[k])
             del frames_scaled[k], masks_scaled[k]
             gc.collect()
 
@@ -444,4 +456,3 @@ if __name__ == '__main__':
         video_writer.write(comp_frame)
     video_writer.release()
     print(f'\nAll results are saved in {save_root}')
-

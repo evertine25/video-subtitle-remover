@@ -1,5 +1,7 @@
 import cv2
 
+from backend.tools.inpaint_tools import normalize_frame_masks
+
 class OpenCVInpaint:
 
     def __init__(self):
@@ -9,7 +11,5 @@ class OpenCVInpaint:
         return cv2.inpaint(frame, mask, 3, cv2.INTER_LINEAR)
 
     def __call__(self, frames, mask):
-        comp = []
-        for frame in frames:
-            comp.append(self.inpaint(frame, mask))
-        return comp
+        masks = normalize_frame_masks(mask, len(frames))
+        return [self.inpaint(frame, masks[index]) for index, frame in enumerate(frames)]

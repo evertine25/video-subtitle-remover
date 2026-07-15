@@ -45,11 +45,16 @@ def merge_big_file_if_not_exists(dir, file, man_filename = None):
         fs.merge(input_dir=dir)
 
 def get_readable_path(path):
+    path = os.path.abspath(os.path.expanduser(os.fspath(path)))
     if sys.platform != 'win32':
         return path
     buf = ctypes.create_unicode_buffer(4096)
-    ctypes.windll.kernel32.GetShortPathNameW(path, buf, 4096)
-    return buf.value
+    result = ctypes.windll.kernel32.GetShortPathNameW(path, buf, 4096)
+    # GetShortPathNameW can fail when 8.3 names are disabled, when a path is
+    # relative, or when a path component has not been created yet. Modern
+    # OpenCV accepts normal absolute Unicode paths, so never return an empty
+    # string in those cases.
+    return buf.value if result > 0 and buf.value else path
 
 def read_image(path):
     if os.path.getsize(path) > 100*1024*1024: # 100MB

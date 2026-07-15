@@ -46,6 +46,50 @@ def create_mask(size, coords_list):
                           (x2, y2), (255, 255, 255), thickness=-1)
     return mask
 
+
+def normalize_frame_masks(input_mask, frame_count):
+    """Return one 2-D uint8 mask per frame while preserving legacy inputs."""
+    if isinstance(input_mask, (list, tuple)):
+        masks = list(input_mask)
+        if len(masks) != frame_count:
+            raise ValueError(
+                f"frame mask count {len(masks)} does not match frame count {frame_count}"
+            )
+    else:
+        mask = np.asarray(input_mask)
+        if mask.ndim == 3 and mask.shape[-1] == 1:
+            mask = mask[:, :, 0]
+        elif mask.ndim == 3 and mask.shape[-1] == 3:
+            mask = cv2.cvtColor(mask, cv2.COLOR_BGR2GRAY)
+        masks = [mask] * frame_count
+
+    normalized = []
+    expected_shape = None
+    for mask in masks:
+        current = np.asarray(mask)
+        if current.ndim == 3 and current.shape[-1] == 1:
+            current = current[:, :, 0]
+        elif current.ndim == 3 and current.shape[-1] == 3:
+            current = cv2.cvtColor(current, cv2.COLOR_BGR2GRAY)
+        if current.ndim != 2:
+            raise ValueError("each frame mask must be a 2-D array")
+        if expected_shape is None:
+            expected_shape = current.shape
+        elif current.shape != expected_shape:
+            raise ValueError("all frame masks must have the same shape")
+        normalized.append((current > 0).astype(np.uint8) * 255)
+    return normalized
+
+
+def union_frame_masks(frame_masks):
+    """Return the binary union used only to locate model crop regions."""
+    if not frame_masks:
+        raise ValueError("frame_masks must not be empty")
+    union = np.zeros(frame_masks[0].shape, dtype=np.uint8)
+    for mask in frame_masks:
+        cv2.bitwise_or(union, mask, dst=union)
+    return union
+
 def get_inpaint_area_by_mask(W, H, h, mask, multiple=1):
     """
     获取字幕去除区域，根据mask来确定需要填补的区域和高度，

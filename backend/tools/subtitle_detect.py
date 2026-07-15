@@ -21,10 +21,54 @@ class SubtitleDetect:
     # 采样间隔，根据视频帧率在 _init_sample_step 中自适应设置
     SAMPLE_STEP = 3
 
-    def __init__(self, video_path, sub_areas=[]):
+    def __init__(
+        self,
+        video_path,
+        sub_areas=[],
+        *,
+        det_limit_side_len=None,
+        det_thresh=None,
+        det_box_thresh=None,
+        det_unclip_ratio=None,
+        sample_step=None,
+        max_frames=None,
+        crop_before_ocr=False,
+        crop_padding=0,
+        crop_upscale=1.0,
+        crop_dedup_iou=0.7,
+    ):
         self.video_path = video_path
         self.sub_areas = sub_areas
+        self.max_frames = int(max_frames) if max_frames is not None else None
+        if self.max_frames is not None and self.max_frames < 1:
+            raise ValueError("max_frames must be at least 1")
+        self.crop_before_ocr = bool(crop_before_ocr)
+        self.crop_padding = int(crop_padding)
+        self.crop_upscale = float(crop_upscale)
+        self.crop_dedup_iou = float(crop_dedup_iou)
+        if self.crop_padding < 0:
+            raise ValueError("crop_padding must be non-negative")
+        if self.crop_upscale <= 0:
+            raise ValueError("crop_upscale must be positive")
+        if not 0.0 <= self.crop_dedup_iou <= 1.0:
+            raise ValueError("crop_dedup_iou must be in [0, 1]")
+        # PaddleOCR TextDetection.predict parameters.  None preserves the
+        # defaults bundled with the selected detection model.
+        self.det_predict_kwargs = {
+            key: value
+            for key, value in {
+                "limit_side_len": det_limit_side_len,
+                "thresh": det_thresh,
+                "box_thresh": det_box_thresh,
+                "unclip_ratio": det_unclip_ratio,
+            }.items()
+            if value is not None
+        }
         self._init_sample_step()
+        if sample_step is not None:
+            if int(sample_step) < 1:
+                raise ValueError("sample_step must be at least 1")
+            self.SAMPLE_STEP = int(sample_step)
 
     def _init_sample_step(self):
         """根据视频帧率自适应设置采样间隔，保持每秒至少采样8帧"""
@@ -49,48 +93,188 @@ class SubtitleDetect:
         return TextDetection(
             model_name=model_config.DET_MODEL_NAME,
             model_dir=model_config.DET_MODEL_DIR,
-            device="cpu",
+            device="gpu:0" if hardware_accelerator.has_cuda() else "cpu",
             enable_hpi=len(onnx_providers) > 0,
         )
 
-    def detect_subtitle(self, img):
-        temp_list = []
-        results = self.text_detector.predict(img)
-        sub_areas = self.sub_areas
-        has_areas = sub_areas is not None and len(sub_areas) > 0
+    def _predict_coordinates(self, img):
+        """Run text detection once and return rectangular coordinates."""
+        coordinates = []
+        results = self.text_detector.predict(img, **self.det_predict_kwargs)
         for res in results:
             dt_polys = res['dt_polys']
             if dt_polys is None or len(dt_polys) == 0:
                 continue
             coordinate_list = get_coordinates(dt_polys.tolist())
-            if not coordinate_list:
-                continue
-            if not has_areas:
-                temp_list.extend(coordinate_list)
-            elif len(sub_areas) == 1:
-                # 单区域快速路径（最常见场景）
-                s_ymin, s_ymax, s_xmin, s_xmax = sub_areas[0]
-                for xmin, xmax, ymin, ymax in coordinate_list:
-                    if s_xmin <= xmin and xmax <= s_xmax and s_ymin <= ymin and ymax <= s_ymax:
-                        temp_list.append((xmin, xmax, ymin, ymax))
+            if coordinate_list:
+                coordinates.extend(coordinate_list)
+        return coordinates
+
+    @staticmethod
+    def _map_box_from_crop(
+        box,
+        crop_xmin,
+        crop_ymin,
+        scale_x,
+        scale_y,
+        frame_width,
+        frame_height,
+    ):
+        """Map an OCR box from an optionally resized crop to the source frame."""
+        xmin, xmax, ymin, ymax = box
+        mapped = (
+            int(round(crop_xmin + xmin / scale_x)),
+            int(round(crop_xmin + xmax / scale_x)),
+            int(round(crop_ymin + ymin / scale_y)),
+            int(round(crop_ymin + ymax / scale_y)),
+        )
+        return (
+            max(0, min(frame_width - 1, mapped[0])),
+            max(0, min(frame_width - 1, mapped[1])),
+            max(0, min(frame_height - 1, mapped[2])),
+            max(0, min(frame_height - 1, mapped[3])),
+        )
+
+    @staticmethod
+    def _box_iou(first, second):
+        ax1, ax2, ay1, ay2 = first
+        bx1, bx2, by1, by2 = second
+        intersection_width = max(0, min(ax2, bx2) - max(ax1, bx1) + 1)
+        intersection_height = max(0, min(ay2, by2) - max(ay1, by1) + 1)
+        intersection = intersection_width * intersection_height
+        first_area = max(0, ax2 - ax1 + 1) * max(0, ay2 - ay1 + 1)
+        second_area = max(0, bx2 - bx1 + 1) * max(0, by2 - by1 + 1)
+        union = first_area + second_area - intersection
+        return intersection / union if union else 0.0
+
+    @classmethod
+    def _deduplicate_boxes(cls, boxes, iou_threshold):
+        """Merge duplicate detections produced by overlapping OCR crops."""
+        if iou_threshold <= 0:
+            return list(boxes)
+        merged = []
+        for box in boxes:
+            for index, existing in enumerate(merged):
+                if cls._box_iou(box, existing) >= iou_threshold:
+                    merged[index] = (
+                        min(box[0], existing[0]),
+                        max(box[1], existing[1]),
+                        min(box[2], existing[2]),
+                        max(box[3], existing[3]),
+                    )
+                    break
             else:
-                for xmin, xmax, ymin, ymax in coordinate_list:
-                    for s_ymin, s_ymax, s_xmin, s_xmax in sub_areas:
-                        if s_xmin <= xmin and xmax <= s_xmax and s_ymin <= ymin and ymax <= s_ymax:
-                            temp_list.append((xmin, xmax, ymin, ymax))
-                            break
+                merged.append(box)
+        return merged
+
+    def _detect_in_crops(self, img, sub_areas):
+        """Run OCR separately inside each configured area and restore coordinates."""
+        frame_height, frame_width = img.shape[:2]
+        boxes = []
+        for s_ymin, s_ymax, s_xmin, s_xmax in sub_areas:
+            area_xmin = max(0, min(frame_width, int(s_xmin)))
+            area_xmax = max(0, min(frame_width, int(s_xmax)))
+            area_ymin = max(0, min(frame_height, int(s_ymin)))
+            area_ymax = max(0, min(frame_height, int(s_ymax)))
+            if area_xmin >= area_xmax or area_ymin >= area_ymax:
+                continue
+
+            crop_xmin = max(0, area_xmin - self.crop_padding)
+            crop_xmax = min(frame_width, area_xmax + self.crop_padding)
+            crop_ymin = max(0, area_ymin - self.crop_padding)
+            crop_ymax = min(frame_height, area_ymax + self.crop_padding)
+            crop = img[crop_ymin:crop_ymax, crop_xmin:crop_xmax]
+            source_height, source_width = crop.shape[:2]
+            if self.crop_upscale != 1.0:
+                resized_width = max(1, int(round(source_width * self.crop_upscale)))
+                resized_height = max(1, int(round(source_height * self.crop_upscale)))
+                crop = cv2.resize(
+                    crop,
+                    (resized_width, resized_height),
+                    interpolation=cv2.INTER_CUBIC,
+                )
+            scale_x = crop.shape[1] / source_width
+            scale_y = crop.shape[0] / source_height
+            for local_box in self._predict_coordinates(crop):
+                box = self._map_box_from_crop(
+                    local_box,
+                    crop_xmin,
+                    crop_ymin,
+                    scale_x,
+                    scale_y,
+                    frame_width,
+                    frame_height,
+                )
+                # Padding supplies context to OCR, but detections still belong
+                # to the original area according to their centre point.
+                center_x = (box[0] + box[1]) / 2
+                center_y = (box[2] + box[3]) / 2
+                if (
+                    area_xmin <= center_x < area_xmax
+                    and area_ymin <= center_y < area_ymax
+                ):
+                    boxes.append(box)
+        return self._deduplicate_boxes(boxes, self.crop_dedup_iou)
+
+    def detect_subtitle(self, img):
+        sub_areas = self.sub_areas
+        has_areas = sub_areas is not None and len(sub_areas) > 0
+        if self.crop_before_ocr and has_areas:
+            return self._detect_in_crops(img, sub_areas)
+
+        coordinate_list = self._predict_coordinates(img)
+        if not has_areas:
+            return coordinate_list
+
+        temp_list = []
+        for xmin, xmax, ymin, ymax in coordinate_list:
+            for s_ymin, s_ymax, s_xmin, s_xmax in sub_areas:
+                if (
+                    s_xmin <= xmin
+                    and xmax <= s_xmax
+                    and s_ymin <= ymin
+                    and ymax <= s_ymax
+                ):
+                    temp_list.append((xmin, xmax, ymin, ymax))
+                    break
         return temp_list
 
     def find_subtitle_frame_no(self, sub_remover=None):
         video_cap = cv2.VideoCapture(get_readable_path(self.video_path))
         frame_count = video_cap.get(cv2.CAP_PROP_FRAME_COUNT)
-        tbar = tqdm(total=int(frame_count), unit='frame', position=0, file=sys.__stdout__, desc='Subtitle Finding')
+        if self.max_frames is not None:
+            frame_count = min(frame_count, self.max_frames)
+        # tqdm normally writes to stderr. Keep the detector on the same stream
+        # as the mask-preview progress bar: some IDE consoles render carriage
+        # returns correctly on stderr but turn sys.__stdout__ updates into many
+        # separate lines.
+        progress_output = sys.stderr
+        # IDE run consoles and GUI-launched processes often do not support
+        # carriage-return line updates. In those environments tqdm would print
+        # one "Subtitle Finding" line per refresh instead of updating in place.
+        show_terminal_progress = bool(
+            progress_output
+            and hasattr(progress_output, "isatty")
+            and progress_output.isatty()
+        )
+        tbar = tqdm(
+            total=int(frame_count),
+            unit='frame',
+            position=0,
+            file=progress_output,
+            desc='Subtitle Finding',
+            mininterval=1.0,
+            dynamic_ncols=True,
+            disable=not show_terminal_progress,
+        )
         current_frame_no = 0
         # 阶段1：采样检测，仅对每隔 sample_step 帧执行 OCR
         sampled_results = {}  # frame_no -> temp_list
         if sub_remover:
             sub_remover.append_output(tr['Main']['ProcessingStartFindingSubtitles'])
         while video_cap.isOpened():
+            if self.max_frames is not None and current_frame_no >= self.max_frames:
+                break
             ret, frame = video_cap.read()
             # 如果读取视频帧失败（视频读到最后一帧）
             if not ret:
@@ -109,19 +293,15 @@ class SubtitleDetect:
             if sub_remover:
                 sub_remover.progress_total = (100 * float(current_frame_no) / float(frame_count)) // 2
         video_cap.release()
-        # 阶段2：插值填充 — 两个采样帧之间都有字幕时，中间帧也标记为有字幕
-        subtitle_frame_no_box_dict = {}
-        detected_nos = sorted(sampled_results.keys())
-        max_gap = self.SAMPLE_STEP * 2
-        for f, next_f in zip(detected_nos, detected_nos[1:]):
-            subtitle_frame_no_box_dict[f] = sampled_results[f]
-            if next_f - f <= max_gap:
-                fill_mask = sampled_results[f]
-                for fill_f in range(f + 1, next_f):
-                    subtitle_frame_no_box_dict[fill_f] = fill_mask
-        # 添加最后一个检测帧
-        if detected_nos:
-            subtitle_frame_no_box_dict[detected_nos[-1]] = sampled_results[detected_nos[-1]]
+        tbar.close()
+        # 阶段2：每个采样帧的 OCR 框覆盖其所属采样块。
+        # 例如 SAMPLE_STEP=3 时，第1帧结果用于1~3帧，第4帧结果用于4~6帧。
+        # 后续颜色精细化仍然逐帧执行，所以字幕提前消失时不会直接产生矩形 mask。
+        subtitle_frame_no_box_dict = self.expand_sampled_results(
+            sampled_results,
+            self.SAMPLE_STEP,
+            int(frame_count),
+        )
         subtitle_frame_no_box_dict = self.unify_regions(subtitle_frame_no_box_dict)
         if sub_remover:
             sub_remover.append_output(tr['Main']['FinishedFindingSubtitles'])
@@ -130,6 +310,20 @@ class SubtitleDetect:
             if len(subtitle_frame_no_box_dict[key]) > 0:
                 new_subtitle_frame_no_box_dict[key] = subtitle_frame_no_box_dict[key]
         return new_subtitle_frame_no_box_dict
+
+    @staticmethod
+    def expand_sampled_results(sampled_results, sample_step, max_frame_no):
+        """Apply each successful OCR result to its complete sampling block."""
+        expanded = {}
+        for sample_frame_no in sorted(sampled_results):
+            boxes = sampled_results[sample_frame_no]
+            block_end = min(
+                max_frame_no,
+                sample_frame_no + max(1, sample_step) - 1,
+            )
+            for frame_no in range(sample_frame_no, block_end + 1):
+                expanded[frame_no] = boxes
+        return expanded
 
     @staticmethod
     def split_range_by_scene(intervals, points):
